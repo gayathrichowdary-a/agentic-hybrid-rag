@@ -1,0 +1,541 @@
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\graph\graph_builder.py =====
+# graph/graph_builder.py
+
+import requests
+import json
+import os
+from graph.graph_store import GraphStore
+# REMOVED: circular import -> "from graph.graph_builder import GraphBuilder"
+
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+
+class GraphBuilder:
+    def __init__(self, embedding=None, chunk_text_fn=None, create_vector_db_fn=None):
+        self.store = GraphStore()
+        self.embedding = embedding
+        self.chunk_text_fn = chunk_text_fn
+        self.create_vector_db_fn = create_vector_db_fn
+
+    def extract_graph(self, text):
+        if not GROK_API_KEY:
+            print("GROK_API_KEY not found.")
+            return {
+                "nodes": [],
+                "edges": []
+            }
+
+        url = "https://api.x.ai/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {GROK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        prompt = f"""
+Extract a knowledge graph from the text.
+
+Return ONLY valid JSON.
+
+Format:
+{{
+    "nodes": [
+        "Entity1",
+        "Entity2"
+    ],
+    "edges": [
+        {{
+            "source": "Entity1",
+            "relation": "related_to",
+            "target": "Entity2"
+        }}
+    ]
+}}
+
+TEXT:
+{text[:8000]}
+"""
+
+        payload = {
+            "model": "grok-beta",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.1
+        }
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+
+            response.raise_for_status()
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            content = content.replace("```json", "").replace("```", "").strip()
+            graph_data = json.loads(content)
+
+            return graph_data
+
+        except Exception as e:
+            print(f"Graph extraction failed: {e}")
+            return {
+                "nodes": [],
+                "edges": []
+            }
+
+    def build(self, text):
+        graph_data = self.extract_graph(text)
+
+        for node in graph_data.get("nodes", []):
+            self.store.add_node(node)
+
+        for edge in graph_data.get("edges", []):
+            self.store.add_edge(
+                edge["source"],
+                edge["relation"],
+                edge["target"]
+            )
+
+        self.store.save_graph()
+
+        print(
+            f"Graph Built: "
+            f"{len(graph_data.get('nodes', []))} nodes, "
+            f"{len(graph_data.get('edges', []))} edges"
+        )
+
+        return graph_data
+
+    def build_from_file(self, file_path, load_document_fn, st=None):
+        """
+        Loads a document from file_path, builds the knowledge graph,
+        chunks the text, and creates a vector DB.
+
+        Args:
+            file_path       : Path to the document file.
+            load_document_fn: Function to load the document (e.g. from LangChain).
+            st              : Streamlit module (optional) for displaying results.
+
+        Returns:
+            dict: {
+                "graph_data" : graph nodes/edges dict,
+                "vector_db"  : the created vector database,
+                "chunks"     : the text chunks
+            }
+        """
+        # 1. Load documents
+        documents = load_document_fn(file_path)
+
+        # 2. Concatenate all page content into one string
+        full_text = ""
+        for doc in documents:
+            full_text += doc.page_content + "\n"
+
+        # 3. Build knowledge graph
+        graph_data = self.build(full_text)
+
+        # 4. Optionally display results in Streamlit
+        if st is not None:
+            st.write("Graph Nodes:", len(graph_data["nodes"]))
+            st.write("Graph Edges:", len(graph_data["edges"]))
+
+        # 5. Chunk text and create vector DB
+        vector_db = None
+        chunks = []
+
+        if self.chunk_text_fn is not None:
+            chunks = self.chunk_text_fn(documents)
+
+        if self.create_vector_db_fn is not None and self.embedding is not None:
+            vector_db = self.create_vector_db_fn(chunks, self.embedding)
+
+        return {
+            "graph_data": graph_data,
+            "vector_db": vector_db,
+            "chunks": chunks
+        }
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\graph\graph_retriever.py =====
+# graph/graph_retriever.py
+
+from graph.graph_store import GraphStore
+class GraphRetriever:
+    def __init__(self):
+        self.store = GraphStore()
+
+    def search(self, query):
+        results = []
+
+        for node in self.store.graph.nodes:
+            if query.lower() in node.lower():
+                neighbors = self.store.get_neighbors(node)
+
+                results.append({
+                    "node": node,
+                    "relations": neighbors
+                })
+
+        return results
+
+    def get_subgraph_context(self, query):
+        results = self.search(query)
+
+        context = ""
+        for r in results:
+            context += f"\nNode: {r['node']}\nRelations: {r['relations']}\n"
+
+        return context
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\graph\graph_store.py =====
+# graph/graph_store.py
+
+import networkx as nx
+import json
+import os
+
+class GraphStore:
+    def __init__(self, path="graph/data_graph.json"):
+        self.path = path
+        self.graph = nx.DiGraph()
+        self.load_graph()
+
+    def add_node(self, node, node_type="entity"):
+        self.graph.add_node(node, type=node_type)
+
+    def add_edge(self, source, relation, target):
+        self.graph.add_edge(source, target, relation=relation)
+
+    def save_graph(self):
+        data = nx.node_link_data(self.graph)
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+
+    def load_graph(self):
+        if os.path.exists(self.path):
+            with open(self.path, "r") as f:
+                data = json.load(f)
+                self.graph = nx.node_link_graph(data)
+
+    def get_neighbors(self, node):
+        return list(self.graph.neighbors(node))
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\graph\__init__.py =====
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\llm\groq_llm.py =====
+from groq import Groq
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+client = Groq(
+    api_key=os.getenv("GROQ_API_KEY")
+)
+
+def generate_answer(context, question=None):
+    # MemoryAgent calls this with a single ready-made prompt
+    if question is None:
+        prompt = context
+        return _ask(prompt)
+
+    prompt = f"""
+You are an intelligent document comparison agent.
+The context may originate from PDFs, Word documents,
+text files, spreadsheets, CSV files, or OCR extracted
+from images.
+
+Treat all sources equally and answer only from the
+provided context.
+Use ONLY the provided context.
+
+Rules:
+1. Use only the supplied context.
+2. Never invent information.
+3. If information is missing, say it is missing.
+4. If multiple documents are involved, compare them.
+5. Quote supporting evidence.
+6. Give a final conclusion.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+    return _ask(prompt)
+
+
+def _ask(prompt):
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0
+    )
+
+    return response.choices[0].message.content
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\llm\__init__.py =====
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\rag\chunker.py =====
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+def chunk_text(documents):
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    chunks = splitter.split_documents(documents)
+
+    return chunks
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\rag\embeddings.py =====
+from functools import lru_cache
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+
+@lru_cache(maxsize=1)
+def load_embedding():
+    # loaded once per server process, not per request
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\rag\pdf_loader.py =====
+from langchain_community.document_loaders import PyPDFLoader
+
+def load_pdf(pdf_path):
+    loader = PyPDFLoader(pdf_path)
+    documents = loader.load()
+
+    return documents
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\rag\retriever.py =====
+def retrieve_docs(vector_db, query):
+
+    docs = vector_db.similarity_search(
+        query,
+        k=3
+    )
+
+    return docs
+def get_context(docs):
+
+    context = ""
+
+    for item in docs:
+
+        # item is (filename, doc)
+        if isinstance(item, tuple):
+            name, doc = item
+            context += f"[SOURCE: {name}]\n"
+        else:
+            doc = item
+
+        context += doc.page_content
+        context += "\n\n"
+
+    return context
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\rag\vector_store.py =====
+from langchain_community.vectorstores import FAISS
+
+
+def create_vector_db(chunks, embedding):
+    return FAISS.from_documents(chunks, embedding)
+
+
+def load_vector_db(folder_path, embedding):
+    return FAISS.load_local(folder_path, embedding, allow_dangerous_deserialization=True)
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\rag\__init__.py =====
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\auth\auth_utils.py =====
+import bcrypt
+
+
+def hash_password(password):
+    return bcrypt.hashpw(
+        password.encode(),
+        bcrypt.gensalt()
+    ).decode()
+
+
+def verify_password(password, hashed_password):
+    return bcrypt.checkpw(
+        password.encode(),
+        hashed_password.encode()
+    )
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\auth\database.py =====
+import sqlite3
+import os
+
+DB_FOLDER = "database"
+DB_PATH = os.path.join(DB_FOLDER, "users.db")
+
+
+def create_database():
+    os.makedirs(DB_FOLDER, exist_ok=True)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # -----------------------------
+    # Users Table
+    # -----------------------------
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            full_name TEXT NOT NULL,
+
+            username TEXT UNIQUE NOT NULL,
+
+            email TEXT UNIQUE NOT NULL,
+
+            password TEXT NOT NULL,
+
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+        )
+    """)
+
+    # -----------------------------
+    # Documents Table
+    # -----------------------------
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS documents(
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            user_id INTEGER NOT NULL,
+
+            file_name TEXT NOT NULL,
+
+            file_path TEXT NOT NULL,
+
+            upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY(user_id) REFERENCES users(id)
+
+        )
+    """)
+    # -----------------------------
+# Chat History Table
+# -----------------------------
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history(
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            user_id INTEGER NOT NULL,
+
+            chat_name TEXT NOT NULL,
+
+            query TEXT NOT NULL,
+
+            answer TEXT NOT NULL,
+
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY(user_id) REFERENCES users(id)
+
+)
+""")
+    cursor.execute("""
+CREATE TABLE IF NOT EXISTS memory(
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    user_id INTEGER,
+
+    memory TEXT,
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+)
+""")
+    cursor.execute("""
+CREATE TABLE IF NOT EXISTS profile_memory(
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    user_id INTEGER,
+
+    key TEXT,
+
+    value TEXT,
+
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY(user_id) REFERENCES users(id)
+
+)
+""")
+
+    conn.commit()
+    conn.close()
+
+
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\auth\__init__.py =====
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\loaders\loader_router.py =====
+import os
+
+from rag.pdf_loader import load_pdf
+from loaders.docx_loader import load_docx
+from loaders.txt_loader import load_txt
+from loaders.csv_loader import load_csv
+from loaders.excel_loader import load_excel
+from loaders.image_loader import load_image
+
+
+def load_document(file_path):
+
+    extension = os.path.splitext(
+        file_path
+    )[1].lower()
+
+    if extension == ".pdf":
+        return load_pdf(file_path)
+
+    elif extension == ".docx":
+        return load_docx(file_path)
+
+    elif extension == ".txt":
+        return load_txt(file_path)
+
+    elif extension == ".csv":
+        return load_csv(file_path)
+
+    elif extension == ".xlsx":
+        return load_excel(file_path)
+
+    elif extension in [".png", ".jpg", ".jpeg"]:
+        return load_image(file_path)
+
+    else:
+        raise Exception(
+            f"{extension} not supported"
+        )
+
+===== D:\AgenticHybridRAG-ready\AgenticHybridRAG-ready\backend\loaders\__init__.py =====

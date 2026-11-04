@@ -1,0 +1,9 @@
+﻿# ignore
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+data/
+install_log.txt
+*.log
